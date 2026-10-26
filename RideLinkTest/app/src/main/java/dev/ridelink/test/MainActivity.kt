@@ -18,10 +18,14 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Minimal test harness for talking to the owner's own Apache RTR 200 4V (2025 TFT)
- * cluster. It scans, connects, performs the unlock the cluster asks for, and lets
- * the owner send a few sample navigation instructions to confirm the display reacts.
- * Every step is printed to an on-screen log that can be shared back for analysis.
+ * Test harness for the owner's own Apache RTR 200 4V (2025 TFT) cluster.
+ *
+ * It scans, connects, and then STREAMS the chosen navigation instruction to the
+ * dash about once a second. Streaming matters for two reasons the first test
+ * revealed: (1) the cluster drops an idle phone after a few seconds, so constant
+ * writes keep the link alive, and (2) the dash is designed to be fed continuously
+ * while navigating. The routine speedometer frames the cluster sends back are
+ * counted quietly so the log stays readable.
  */
 @SuppressLint("MissingPermission")
 class MainActivity : Activity() {
@@ -34,6 +38,30 @@ class MainActivity : Activity() {
     private var gatt: BluetoothGatt? = null
     private var writeChar: BluetoothGattCharacteristic? = null
     private val seen = LinkedHashMap<String, BluetoothDevice>()
+    private var lastDevice: BluetoothDevice? = null
+    private var reconnectTries = 0
+
+    // streaming state
+    private var streamPlain: ByteArray? = null
+    private var streamLabel = ""
+    private var sendTicks = 0
+    private var inCount = 0
+    private var lastInSummary = 0L
+    private var firstWriteOk = false
+    private var writeFailsLogged = 0
+
+    private val streamer = object : Runnable {
+        override fun run() {
+            val p = streamPlain
+            if (p != null && writeChar != null) {
+                writeRaw(ClusterProtocol.navWire(p), streamLabel, log = false)
+                sendTicks++
+                if (sendTicks % 5 == 0)
+                    logln("… still sending \"$streamLabel\" (x$sendTicks) · cluster frames in: $inCount")
+            }
+            ui.postDelayed(this, 1000)
+        }
+    }
 
     private lateinit var statusText: TextView
     private lateinit var deviceBox: LinearLayout
@@ -49,16 +77,10 @@ class MainActivity : Activity() {
     // ---- permissions ---------------------------------------------------------
 
     private fun requestPerms() {
-        val needed = mutableListOf<String>()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            needed += Manifest.permission.BLUETOOTH_SCAN
-            needed += Manifest.permission.BLUETOOTH_CONNECT
-        } else {
-            needed += Manifest.permission.ACCESS_FINE_LOCATION
-        }
-        val missing = needed.filter {
-            checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
-        }
+        val needed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+            listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+        else listOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        val missing = needed.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 1)
     }
 
@@ -70,7 +92,7 @@ class MainActivity : Activity() {
             val name = dev.name ?: return
             if (seen.put(dev.address, dev) == null) {
                 logln("Found: $name  [${dev.address}]")
-                ui.post { addDeviceButton(dev, name) }
+                ui.post { deviceBox.addView(button("Connect to $name") { connect(dev) }) }
             }
         }
         override fun onScanFailed(errorCode: Int) = logln("Scan failed: $errorCode")
@@ -81,18 +103,17 @@ class MainActivity : Activity() {
         if (a == null || !a.isEnabled) { logln("Turn Bluetooth ON first."); return }
         seen.clear()
         deviceBox.removeAllViews()
-        logln("Scanning… pick your bike from the list when it appears.")
+        logln("Scanning… pick your bike when it appears.")
         a.bluetoothLeScanner?.startScan(scanCb)
-        ui.postDelayed({
-            a.bluetoothLeScanner?.stopScan(scanCb)
-            logln("Scan stopped.")
-        }, 12_000)
+        ui.postDelayed({ a.bluetoothLeScanner?.stopScan(scanCb); logln("Scan stopped.") }, 10_000)
     }
 
     // ---- connect + GATT ------------------------------------------------------
 
     private fun connect(dev: BluetoothDevice) {
         adapter?.bluetoothLeScanner?.stopScan(scanCb)
+        lastDevice = dev
+        reconnectTries = 0
         setStatus("Connecting to ${dev.name}…")
         gatt = dev.connectGatt(this, false, gattCb, BluetoothDevice.TRANSPORT_LE)
     }
@@ -100,12 +121,22 @@ class MainActivity : Activity() {
     private val gattCb = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, st: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                logln("Connected. Asking for services…")
+                logln("Connected. Negotiating…")
                 g.requestMtu(185)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 logln("Disconnected (status $st).")
                 setStatus("Disconnected")
                 writeChar = null
+                stopStream()
+                g.close()
+                // The cluster sometimes drops the link; try to come back automatically.
+                if (lastDevice != null && reconnectTries < 5) {
+                    reconnectTries++
+                    logln("Reconnecting (try $reconnectTries)…")
+                    ui.postDelayed({ lastDevice?.let {
+                        gatt = it.connectGatt(this@MainActivity, false, gattCb, BluetoothDevice.TRANSPORT_LE)
+                    } }, 1200)
+                }
             }
         }
 
@@ -124,17 +155,32 @@ class MainActivity : Activity() {
             val svc = g.getService(ClusterProtocol.SERVICE_UUID)
             if (svc == null) { logln("Expected service not found — share the list above."); return }
             writeChar = svc.getCharacteristic(ClusterProtocol.WRITE_UUID)
-            val notify = svc.getCharacteristic(ClusterProtocol.NOTIFY_UUID)
-            if (notify != null) {
-                g.setCharacteristicNotification(notify, true)
-                notify.getDescriptor(ClusterProtocol.CCCD_UUID)?.let {
-                    @Suppress("DEPRECATION")
-                    it.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    @Suppress("DEPRECATION") g.writeDescriptor(it)
+            svc.getCharacteristic(ClusterProtocol.NOTIFY_UUID)?.let { n ->
+                g.setCharacteristicNotification(n, true)
+                n.getDescriptor(ClusterProtocol.CCCD_UUID)?.let {
+                    @Suppress("DEPRECATION") run {
+                        it.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        g.writeDescriptor(it)
+                    }
                 }
             }
+            reconnectTries = 0
+            firstWriteOk = false
+            writeFailsLogged = 0
             setStatus("Connected to ${g.device.name}")
-            logln("Ready. The cluster may now send an unlock request on its own.")
+            logln("Ready. Auto-sending \"Turn LEFT 200 m\" every second — this keeps the")
+            logln("link alive and drives the dash. Use the buttons to change it, or Stop.")
+            logln("TIP: cycle the dash's mode/info button to its navigation screen.")
+            startStream("left 200m", leftFrame())
+        }
+
+        override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                if (writeFailsLogged < 3) { logln("⚠ write rejected (status $status)"); writeFailsLogged++ }
+            } else if (!firstWriteOk) {
+                firstWriteOk = true
+                logln("✓ first instruction accepted by the cluster")
+            }
         }
 
         override fun onCharacteristicChanged(
@@ -146,24 +192,31 @@ class MainActivity : Activity() {
             handleIncoming(c.value ?: ByteArray(0))
     }
 
-    /**
-     * The Apache cluster isn't expected to send an unlock challenge (that only
-     * applies to the U388 scooter in the official app). We just log whatever the
-     * cluster sends — both as received and unscrambled — for diagnostics.
-     */
+    /** Quietly count the routine speedometer frames; shout about anything unusual. */
     private fun handleIncoming(raw: ByteArray) {
         if (raw.isEmpty()) return
-        logln("<= raw   ${ClusterProtocol.hex(raw)}")
-        logln("<= clear ${ClusterProtocol.hex(ClusterProtocol.unscramble(raw))}")
+        inCount++
+        val clear = ClusterProtocol.unscramble(raw)
+        val id = clear.getOrNull(1)?.toInt()?.and(0xFF) ?: -1
+        val routine = id == 0x10 || id == 0x12 || id == 0x18
+        if (!routine) {
+            logln("<= NEW ${ClusterProtocol.hex(raw)}  (clear ${ClusterProtocol.hex(clear)})")
+        } else {
+            val now = System.currentTimeMillis()
+            if (now - lastInSummary > 5000) {
+                lastInSummary = now
+                logln("cluster alive · $inCount frames received so far")
+            }
+        }
     }
 
     // ---- sending -------------------------------------------------------------
 
-    private fun writeRaw(wire: ByteArray, label: String) {
+    private fun writeRaw(wire: ByteArray, label: String, log: Boolean = true) {
         val c = writeChar
         val g = gatt
-        if (c == null || g == null) { logln("Not connected."); return }
-        logln("=> $label: ${ClusterProtocol.hex(wire)}")
+        if (c == null || g == null) { if (log) logln("Not connected."); return }
+        if (log) logln("=> $label: ${ClusterProtocol.hex(wire)}")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             g.writeCharacteristic(c, wire, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
         } else {
@@ -175,10 +228,31 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun sendNav(label: String, plain: ByteArray) =
-        writeRaw(ClusterProtocol.navWire(plain), label)
+    private fun startStream(label: String, plain: ByteArray) {
+        streamPlain = plain
+        streamLabel = label
+        sendTicks = 0
+        logln("▶ now sending \"$label\": ${ClusterProtocol.hex(ClusterProtocol.navWire(plain))}")
+        ui.removeCallbacks(streamer)
+        ui.post(streamer)
+    }
 
-    // ---- UI building ---------------------------------------------------------
+    private fun stopStream() {
+        streamPlain = null
+        ui.removeCallbacks(streamer)
+    }
+
+    // frame presets
+    private fun leftFrame() =
+        ClusterProtocol.navFrame(200, 5, 2300, ClusterProtocol.Picto.LEFT, ClusterProtocol.Prefix.TURN_AHEAD)
+    private fun rightFrame() =
+        ClusterProtocol.navFrame(200, 5, 2300, ClusterProtocol.Picto.RIGHT, ClusterProtocol.Prefix.TURN_AHEAD)
+    private fun straightFrame() =
+        ClusterProtocol.navFrame(1200, 8, 4000, ClusterProtocol.Picto.STRAIGHT, ClusterProtocol.Prefix.STRAIGHT_LONG)
+    private fun arrivedFrame() =
+        ClusterProtocol.navFrame(0, 0, 0, ClusterProtocol.Picto.ARRIVED, ClusterProtocol.Prefix.NONE, navStatus = 0)
+
+    // ---- UI ------------------------------------------------------------------
 
     private fun buildUi(): View {
         val root = LinearLayout(this).apply {
@@ -192,23 +266,12 @@ class MainActivity : Activity() {
         deviceBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(deviceBox)
 
-        root.addView(label("2. Send a test instruction to the TFT"))
-        root.addView(button("Turn LEFT in 200 m") {
-            sendNav("left 200m", ClusterProtocol.navFrame(
-                200, 5, 2300, ClusterProtocol.Picto.LEFT, ClusterProtocol.Prefix.TURN_AHEAD))
-        })
-        root.addView(button("Turn RIGHT in 200 m") {
-            sendNav("right 200m", ClusterProtocol.navFrame(
-                200, 5, 2300, ClusterProtocol.Picto.RIGHT, ClusterProtocol.Prefix.TURN_AHEAD))
-        })
-        root.addView(button("Go STRAIGHT 1.2 km") {
-            sendNav("straight 1200m", ClusterProtocol.navFrame(
-                1200, 8, 4000, ClusterProtocol.Picto.STRAIGHT, ClusterProtocol.Prefix.STRAIGHT_LONG))
-        })
-        root.addView(button("You have ARRIVED") {
-            sendNav("arrived", ClusterProtocol.navFrame(
-                0, 0, 0, ClusterProtocol.Picto.ARRIVED, ClusterProtocol.Prefix.NONE, navStatus = 0))
-        })
+        root.addView(label("2. Choose what to stream to the dash"))
+        root.addView(button("Turn LEFT in 200 m") { startStream("left 200m", leftFrame()) })
+        root.addView(button("Turn RIGHT in 200 m") { startStream("right 200m", rightFrame()) })
+        root.addView(button("Go STRAIGHT 1.2 km") { startStream("straight 1200m", straightFrame()) })
+        root.addView(button("You have ARRIVED") { startStream("arrived", arrivedFrame()) })
+        root.addView(button("■ STOP sending") { stopStream(); logln("■ stopped sending.") })
 
         root.addView(label("3. Try any arrow code (0–120)"))
         val arrow = EditText(this).apply {
@@ -216,25 +279,22 @@ class MainActivity : Activity() {
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
         }
         root.addView(arrow)
-        root.addView(button("Send that arrow at 150 m") {
+        root.addView(button("Stream that arrow at 150 m") {
             val code = arrow.text.toString().toIntOrNull()
             if (code == null) logln("Enter a number first.")
-            else sendNav("arrow $code", ClusterProtocol.navFrame(
-                150, 3, 1500, code, ClusterProtocol.Prefix.TURN_AHEAD))
+            else startStream("arrow $code",
+                ClusterProtocol.navFrame(150, 3, 1500, code, ClusterProtocol.Prefix.TURN_AHEAD))
         })
 
         root.addView(label("Log (share this back)"))
         logText = TextView(this).apply { textSize = 12f; setTextIsSelectable(true) }
         val scroll = ScrollView(this).apply {
             addView(logText)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 600)
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 600)
         }
         root.addView(scroll)
 
-        val outer = ScrollView(this)
-        outer.addView(root)
-        return outer
+        return ScrollView(this).apply { addView(root) }
     }
 
     private fun button(text: String, onClick: () -> Unit) = Button(this).apply {
@@ -248,12 +308,6 @@ class MainActivity : Activity() {
         setTypeface(typeface, android.graphics.Typeface.BOLD)
     }
 
-    private fun addDeviceButton(dev: BluetoothDevice, name: String) {
-        deviceBox.addView(button("Connect to $name") { connect(dev) })
-    }
-
-    // ---- logging -------------------------------------------------------------
-
     private fun setStatus(s: String) = ui.post { statusText.text = s }
 
     private fun logln(s: String) {
@@ -266,6 +320,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        stopStream()
         gatt?.close()
     }
 }
