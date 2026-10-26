@@ -118,7 +118,7 @@ class MainActivity : Activity() {
         gatt = dev.connectGatt(this, false, gattCb, BluetoothDevice.TRANSPORT_LE)
     }
 
-    private val gattCb = object : BluetoothGattCallback() {
+    private val gattCb: BluetoothGattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, st: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 logln("Connected. Negotiating…")
